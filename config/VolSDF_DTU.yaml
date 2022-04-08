@@ -1,0 +1,66 @@
+_parent_: config/base.yaml
+
+arch:                                                       # architectural optionss
+    layers_surface: [null,256,256,256,256,256,256,256,256] # hidden layers for occupancy filed with uncertainty MLP
+    layers_radiance: [null,256,256,256,3]                 # hidden layers for appearance MLP
+    skip: [4]                                               # skip connections
+    posenc:                                                 # positional encoding:
+        L_3D: 6                                            # number of bases (3D point)
+        L_view: 0                                           # number of bases (viewpoint)
+    density_activ: softplus                                 # activation function for output volume density
+    tf_init: true                                           # initialize network weights in TensorFlow style
+
+VolSDF:                                                       # VolSDF options
+    view_dep: true                                          # condition MLP on viewpoint
+    depth:                                                  # depth-related options
+        param: metric                                      # depth parametrization (for sampling along the ray)
+        min_d: 0.0
+        max_d: 6                                            # In VolSDF the max depth is 2*r
+    obj_bounding_radius: 3.0                               # scene sphere, as in the VolSDF paper
+    outside_scene: "builtin"                               # choice from [builtin,nerfplusplus], the rendering for the background
+    max_upsample_iter: 6                                   # up sample iteratioms, as in the VolSDF paper
+    sample_intvs: 128                                       # the init number of samples
+    final_sample_intvs: 64                                 # according to paper the final sample intervals are 64
+    rand_rays: 1024                                          # number of random rays for each step
+    beta_init: 0.1                                         # the initial beta for VolSDF
+    speed_factor: 1.0
+    volsdf_sampling: true
+    max_bisection_itr: 10                                  # the max bisection iteration
+    eps: 0.1                                               # the epsilon for bound error
+
+data:                                                       # data options
+    dataset: DTU                                           # dataset name
+    scene:
+    image_size: [150,200]                                   # input image sizes [height,width]    the raw size [1200,1600] only support scale HW same time
+    scale_radius: 3.0                                       # scale all the cameras to be within this radius
+    num_workers: 4                                          # number of parallel workers for data loading
+    preload: true                                           # preload the entire dataset into the memory
+    val_ratio: 0.1                                          # ratio of sequence split for validation
+
+camera:                                                     # camera options
+    model: perspective                                      # type of camera model
+    ndc: false                                              # reparametrize as normalized device coordinates (NDC)
+    noise: false
+    zero_init: false
+
+loss_weight:                                                # loss weights (in log scale)
+    render: 0                                               # RGB rendering loss
+    w_eikonal: -1
+
+optim:                                                      # optimization options
+    lr: 5.e-4                                               # learning rate (main)
+    lr_end: 1.e-6                                           # terminal learning rate (only used with sched.type=ExponentialLR)
+    sched:                                                  # learning rate scheduling options
+        type: ExponentialLR                                 # scheduler (see PyTorch doc)
+        gamma:                                               # decay rate (can be empty if lr_end were specified)
+
+batch_size: 1                                                # batch size
+max_epoch:                                                  # train to maximum number of epochs (not used for NeRF/BARF)
+max_iter: 100000                                            # train to maximum number of iterations
+H: 150                                                      # the img H
+W: 200                                                      # the img W
+freq:                                                       # periodic actions during training
+    scalar: 100                                             # log losses and scalar states (every N iterations)
+    vis: 100                                               # visualize results (every N iterations)
+    val: 2000                                               # validate on val set (every N iterations)
+    ckpt: 5000                                              # save checkpoint (every N iterations)
