@@ -22,7 +22,7 @@ import utils.utils_vis as util_vis
 from utils.utils import log,debug
 from . import base
 import utils.camera as camera
-
+from utils.utils_vis import extract_mesh
 epsilon = 1e-6
 
 class Model(base.Model):
@@ -57,7 +57,11 @@ class Model(base.Model):
                 opt.optim.sched.gamma = (opt.optim.lr_end / opt.optim.lr) ** (1. / opt.max_iter)
             kwargs = {k: v for k, v in opt.optim.sched.items() if k != "type"}
             self.sched = scheduler(self.optim, **kwargs)
-
+    def save_checkpoint(self,opt,ep=0,it=0,latest=False):
+        self.graph.state_dict().update({"ln_beta":self.graph.beta})
+        util.save_checkpoint(opt,self,ep=ep,it=it,latest=latest)
+        if not latest:
+            log.info("checkpoint saved: ({0}) {1}, epoch {2} (iteration {3})".format(opt.group,opt.name,ep,it))
     def train(self,opt):
         # before training
         log.title("TRAINING START")
@@ -67,10 +71,28 @@ class Model(base.Model):
         # training
         #if self.iter_start == 0: self.validate(opt, 0)
         loader = tqdm.trange(opt.max_iter, desc="training", leave=False)
+        num_scenes=len(self.train_data.all.idx)
+        var = edict()
+        if self.iter_start== 0: self.validate(opt, 0)
         for self.it in loader:
             if self.it < self.iter_start: continue
             # set var to all available images
-            var = self.train_data.all
+            # pdb.set_trace()
+            # for var in self.train_data:
+            #     #var = self.train_data.all
+            #     var=edict(var)
+            #     var.idx=[var.idx]
+            #     var['image']=var['image'][None,:,:].to(opt.device)
+            #     var['mask']=var['mask'][None,:].to(opt.device)
+            #     var['intr']=var['intr'][None,:,:].to(opt.device)
+            #     var['pose'] = var['pose'][None, :, :].to(opt.device)
+            #     print("training the pic of idx{}".format(var.idx[0]))
+            idx=torch.randperm(num_scenes,device=opt.device)[0]
+            var.idx=[idx]
+            var['image']=self.train_data.all['image'][idx,...].unsqueeze(0)
+            var['mask'] = self.train_data.all['mask'][idx, ...].unsqueeze(0)
+            var['intr'] = self.train_data.all['intr'][idx, ...].unsqueeze(0)
+            var['pose'] = self.train_data.all['pose'][idx, ...].unsqueeze(0)
             self.train_iteration(opt, var, loader)
             if opt.optim.sched: self.sched.step()
             if self.it % opt.freq.val == 0: self.validate(opt, self.it)
@@ -89,16 +111,31 @@ class Model(base.Model):
         if split == "train":
             lr = self.optim.param_groups[0]["lr"]
             self.tb.add_scalar("{0}/{1}".format(split, "lr"), lr, step)
-        # compute PSNR
-        psnrfr = -10 * loss.render.log10()
-        self.tb.add_scalar("{0}/{1}".format(split, "PSNR_render"), psnrfr, step)
-        self.tb.add_scalar("{0}/{1}".format(split, "eikonal_loss"), loss.w_eikonal, step)
+            # compute PSNR
+            psnrfr = -10 * (loss.render**2).log10()
+            self.tb.add_scalar("{0}/{1}".format(split, "PSNR_render"), psnrfr, step)
+            self.tb.add_scalar("{0}/{1}".format(split, "beta"), var.beta, step)
+        else:
+            psnrfr = -10 * (loss.render).log10()
+            self.tb.add_scalar("{0}/{1}".format(split, "test_PSNR"), psnrfr, step)
 
 
 
     @torch.no_grad()
     def visualize(self, opt, var, step=0, split="train", eps=1e-10):
-
+        if split=="val":
+            H,W=opt.data.val_img_size
+            self.tb.add_image("{0}/{1}".format(split, "ground_truth_rgb"), var.image.permute(0,2,1).view(3,H,W))
+            self.tb.add_image("{0}/{1}".format(split, "predicted_rgb"), var.rgb.permute(0, 2, 1).view(3, H, W))
+            if (step%opt.freq.vis_mesh==0)&(step>0):
+                os.makedirs("{0}/mesh".format(opt.output_path),exist_ok=True)
+                opt.mesh_dir="{0}/mesh".format(opt.output_path)
+                extract_mesh(
+                    self.graph.VolSDF,
+                    filepath=os.path.join(opt.mesh_dir, '{:08d}.ply'.format(step)),
+                    volume_size=2.0,
+                    log=log,
+                    show_progress=True)
         return
 
 class VolSDF(nn.Module):
@@ -114,7 +151,7 @@ class VolSDF(nn.Module):
         print("building the mlp for surface......")
         self.mlp_surface = torch.nn.ModuleList()
         L_surface = util.get_layer_dims(opt.arch.layers_surface)
-        bias = 1.0
+        bias = 1
         for li, (k_in, k_out) in enumerate(L_surface):
             if li == 0: k_in = input_3D_dim
             if li in opt.arch.skip: k_in += input_3D_dim
@@ -149,12 +186,12 @@ class VolSDF(nn.Module):
             self.mlp_radiance.append(linear)
         print("defining the activation fuction......")
         # beta=100 is very important, but i am not sure why is that
-        self.softplus = nn.Softplus(beta=100)
+        self.softplus = nn.Softplus(beta=100,threshold=20)
         self.relu = nn.ReLU()
         self.tanh = nn.Tanh()
         self.sigmoid = nn.Sigmoid()
 
-    def infer_sdf(self, p):
+    def infer_sdf(self, p,mode="only_sdf"):
         p_rescale=p / self.rescale
         if self.opt.arch.posenc:
             points_enc = self.positional_encoding(self.opt, p_rescale, L=self.opt.arch.posenc.L_3D)
@@ -162,24 +199,29 @@ class VolSDF(nn.Module):
         else: points_enc = p_rescale
         feat=points_enc
         for li,layer in enumerate(self.mlp_surface):
-            if li in self.opt.arch.skip: feat = torch.cat([points_enc,feat],dim=-1)/ np.sqrt(2)
-            feat = self.softplus(layer(feat))
-        return feat
+            if li in self.opt.arch.skip: feat = torch.cat([feat,points_enc],dim=-1)/ np.sqrt(2)
+            feat = layer(feat)
+            if li <= len(self.mlp_surface) - 2:
+                feat = self.softplus(feat)
+        if mode=="only_sdf":
+            return feat[...,:1]
+        else:
+            return feat
     def infer_rad(self,points_3D, normals, ray_enc, feat):
         rendering_input = torch.cat([points_3D, ray_enc, normals, feat], dim=-1)
         x = rendering_input
         num_layers_app = len(util.get_layer_dims(self.opt.arch.layers_radiance))
         for li, layer in enumerate(self.mlp_radiance):
             x = layer(x)
-            if li < num_layers_app - 2:
-                x = self.softplus(x)
+            if li <= num_layers_app - 2:
+                x = self.relu(x)
         x = self.sigmoid(x)
         return x
 
     def gradient(self, p):
         with torch.enable_grad():
             p.requires_grad_(True)
-            y = self.infer_sdf(p)[..., :1]
+            y = self.infer_sdf(p,mode="only_sdf")
             d_output = torch.ones_like(y, requires_grad=False, device=y.device)
             gradients = torch.autograd.grad(
                 outputs=y,
@@ -190,7 +232,7 @@ class VolSDF(nn.Module):
                 only_inputs=True, allow_unused=True)[0]
             return gradients
     def forward(self, opt,points_3D, ray_unit=None, only_sdf=False, return_addocc=False):
-        x = self.infer_sdf(points_3D)
+        x = self.infer_sdf(points_3D,mode="ret_feat")
         if only_sdf:
             sdf=x[..., :1]
             return torch.min(sdf, opt.VolSDF.obj_bounding_radius - points_3D.norm(dim=-1, keepdim=True))
@@ -228,17 +270,17 @@ class VolSDF(nn.Module):
         ray_length = ray.norm(dim=-1,keepdim=True) # [B,HW,1]
         # volume rendering: compute probability (using quadrature)
         depth_intv_samples = depth_samples[...,1:,0]-depth_samples[...,:-1,0] # [B,HW,N-1]
-        depth_intv_samples = torch.cat([depth_intv_samples,torch.empty_like(depth_intv_samples[...,:1]).fill_(1e10)],dim=2) # [B,HW,N]
-        dist_samples = depth_intv_samples*ray_length # [B,HW,N]
-        sigma_delta = density_samples*dist_samples # [B,HW,N]
+        #depth_intv_samples = torch.cat([depth_intv_samples,torch.empty_like(depth_intv_samples[...,:1]).fill_(1e10)],dim=2) # [B,HW,N]
+        dist_samples = depth_intv_samples*ray_length # [B,HW,N-1]
+        sigma_delta = density_samples[...,:-1]*dist_samples # [B,HW,N-1]
         alpha = 1-(-sigma_delta).exp_() # [B,HW,N]
-        T = (-torch.cat([torch.zeros_like(sigma_delta[...,:1]),sigma_delta[...,:-1]],dim=2).cumsum(dim=2)).exp_() # [B,HW,N]
+        T = (-torch.cat([torch.zeros_like(sigma_delta[...,:1]),sigma_delta],dim=2).cumsum(dim=2)).exp_()[...,:-1] # [B,HW,N]
         prob = (T*alpha)[...,None] # [B,HW,N,1]
         # integrate RGB and depth weighted by probability
-        rgb = (rgb_samples*prob).sum(dim=2) # [B,HW,3]
+        rgb = (rgb_samples[...,:-1,:]*prob).sum(dim=2) # [B,HW,3]
         opacity = prob.sum(dim=2) # [B,HW,1]
         # pdb.set_trace()
-        return rgb
+        return rgb,prob
 
 # def function(x: torch.tensor) 这样可以指定输入变量类型
 
@@ -252,6 +294,9 @@ class Graph(base.Graph):
         beta_init=np.log(opt.VolSDF.beta_init) / self.speed_factor
         beta_optim=torch.from_numpy(np.array([beta_init], dtype=np.float32)).to(opt.device)
         self.beta=nn.Parameter(data=beta_optim, requires_grad=True)       # when declare a variable of nn.Parameter(), it will be added to net.parameters()
+        # self.parameters.update({"beta":nn.Parameter(data=beta_optim, requires_grad=True)})
+        # self.state_dict().update({"beta":self.beta})
+        # pdb.set_trace()
         self.obj_bounding_radius = opt.VolSDF.obj_bounding_radius         # see supple, the camera pose and object were normalized to a certain sphere
         self.use_sphere_bg = (opt.VolSDF.outside_scene=="builtin")        # if use the nerf++ to learn the bg
         if self.use_sphere_bg==False:                                     # chose nerf++ as the bg
@@ -262,7 +307,7 @@ class Graph(base.Graph):
         # alpha and beta are learnable parameters
         # sdf [B,HW,N,1]
         exp = 0.5 * torch.exp(-torch.abs(sdf) / beta)
-        psi = torch.where(sdf >= 0, exp, 1 - exp)
+        psi = torch.where(sdf > 0, exp, 1 - exp)
         return alpha * psi
 
     def error_bound(self,d_vals, sdf, alpha, beta):
@@ -303,7 +348,7 @@ class Graph(base.Graph):
         :param pos: the 3D space point [B,HW,N,3]
         :return:
         '''
-        sdf = self.VolSDF.infer_sdf(pos)[..., :1]
+        sdf = self.VolSDF.infer_sdf(pos,mode="only_sdf")
         if self.use_sphere_bg:              # which filter the pos outside the sphere
             return torch.min(sdf, self.obj_bounding_radius - pos.norm(dim=-1,keepdim=True))
         else:
@@ -314,27 +359,44 @@ class Graph(base.Graph):
         # render images
         if opt.VolSDF.rand_rays and mode in ["train", "test-optim"]:
             # sample random rays for optimization
+            #var.ray_idx= torch.arange(0,opt.VolSDF.rand_rays )
             var.ray_idx = torch.randperm(opt.H * opt.W, device=opt.device)[:opt.VolSDF.rand_rays // batch_size]
             ret = self.render(opt, pose, intr=var.intr, ray_idx=var.ray_idx, mode=mode)  # [B,N,3],[B,N,1]
         else:
             # render full image (process in slices)
-            ret = self.render_by_slices(opt, pose, intr=var.intr, mode=mode) if opt.VolSDF.rand_rays else \
-                self.render(opt, pose, intr=var.intr, mode=mode)  # [B,HW,3],[B,HW,1]
+            ret = self.render_by_slices(opt, pose, intr=var.intr, mode=mode)
         var.update(ret)
         return var
+    def render_by_slices(self,opt,pose,intr=None,mode=None):
+        ret_all = edict(rgb=[])
+        H,W=opt.data.val_img_size
+        for c in range(0,H*W,opt.VolSDF.rand_rays):
+            ray_idx = torch.arange(c,min(c+opt.VolSDF.rand_rays,H*W),device=opt.device)
+            ret = self.render(opt,pose,intr=intr,ray_idx=ray_idx,mode=mode) # [B,R,3],[B,R,1]
+            ret_all["rgb"].append(ret["rgb"])
+        # group all slices of images
+        for k in ret_all: ret_all[k] = torch.cat(ret_all[k],dim=1)
+        # t1=time.perf_counter()
+        # print(str(t1-t0))
+        return ret_all
+
     def get_pose(self,opt,var,mode=None):
         return var.pose
     def compute_loss(self,opt,var,ret,mode=None):
         loss = edict()
         batch_size = len(var.idx)
-        image = var.image.view(batch_size, 3, opt.H * opt.W).permute(0, 2, 1)
+        image = var.image
         if opt.VolSDF.rand_rays and mode in ["train", "test-optim"]:
-            image = image[:, var.ray_idx]
+            image = image[:, var.ray_idx,:]
         # compute image losses
-        if opt.loss_weight.render is not None:
-            loss.render = self.MSE_loss(var.rgb, image)
-        if opt.loss_weight.w_eikonal is not None:
-            loss.w_eikonal = self.MSE_loss(torch.norm(var.normal,dim=-1),torch.ones_like(torch.norm(var.normal,dim=-1)).to(opt.device))
+        if mode=="train":
+            if opt.loss_weight.render is not None:
+                loss.render = nn.functional.l1_loss(var.rgb, image)
+            if opt.loss_weight.w_eikonal is not None:
+                loss.w_eikonal = self.MSE_loss(torch.norm(var.normal,dim=-1),torch.ones_like(torch.norm(var.normal,dim=-1)).to(opt.device))
+        else:
+            loss.render=self.MSE_loss(var.rgb,var.image)
+
         return loss
 
     def sample_depth(self, opt, batch_size, num_rays=None):
@@ -367,7 +429,6 @@ class Graph(base.Graph):
             batch_size=center.shape[0]
             depth_samples = self.sample_depth(opt, batch_size, num_rays=ray.shape[1])  # [B,HW,N,1]
             unisamp = camera.get_3D_points_from_depth(opt, center, ray, depth_samples,multi_samples=True)    # [B,HW,N,3]
-
             sdf=self.forward_surface(unisamp)     # [B,HW,N,1]
             alpha_graph,beta_graph=self.forward_ab()           # [attain the alpha and beta
             sigma = self.sdf_to_sigma(sdf, alpha_graph, beta_graph)    # attain the sigma
@@ -383,22 +444,22 @@ class Graph(base.Graph):
             final_converge_flag = torch.zeros([*mask.shape],dtype=torch.bool).to(opt.device)                                   # [B,HW]
             # if the sampling is fine
             if (~mask).sum() > 0:
-                final_fine_dvals[~mask] = self.opacity_to_sample(opt,depth_samples.repeat([*mask.shape,1,1]).squeeze(-1)[~mask], sdf.squeeze(-1)[~mask], alpha_graph, beta_graph,*mask.shape)
+                final_fine_dvals[~mask] = self.opacity_to_sample(opt,depth_samples.repeat([*mask.shape,1,1]).squeeze(-1)[~mask], sdf.squeeze(-1)[~mask], alpha_graph, beta_graph,*mask.shape)[:,:,0]
                 final_iter_usage[~mask] = 0
             final_converge_flag[~mask] = True
 
             current_samp = depth_samples.shape[-2]
             it_algo = 0
-            depth_samples=depth_samples.squeeze(-1)
+            depth_samples=depth_samples.squeeze(-1).repeat([*bounds.shape[:-1],1])
             sdf=sdf.squeeze(-1)
             while it_algo < opt.VolSDF.max_upsample_iter:
                 print("sampling algo iteration{}".format(it_algo))
                 it_algo += 1
                 if mask.sum() > 0:
                     # intuitively, the bigger bounds error, the more weights in sampling
-                    upsampled_d_vals_masked=self.sample_pdf(depth_samples[0,:,:],bounds_masked,opt.VolSDF.sample_intvs+2,det=True)[..., 1:-1]
+                    upsampled_d_vals_masked=self.sample_pdf(depth_samples[mask],bounds_masked,opt.VolSDF.sample_intvs+2,det=True)[..., 1:-1]
                     # upsample_depth
-                    depth_samples=depth_samples.expand(*mask.shape,depth_samples.shape[-1])
+                    # depth_samples=depth_samples.expand(*mask.shape,depth_samples.shape[-1])
                     depth_samples = torch.cat([depth_samples, torch.zeros([*depth_samples.shape[:2], opt.VolSDF.sample_intvs]).to(opt.device)], dim=-1)
                     sdf = torch.cat([sdf, torch.zeros([*sdf.shape[:2], opt.VolSDF.sample_intvs]).to(opt.device)], dim=-1)
 
@@ -443,7 +504,7 @@ class Graph(base.Graph):
                             alpha_tmp = 1. / beta_tmp
                             # alpha_tmp = alpha_net
                             # [Submasked]
-                            bounds_tmp_max = self.error_bound(d_samp_tmp, sdf_tmp, alpha_tmp, beta_tmp).max(dim=-1).values
+                            bounds_tmp_max = self.error_bound(d_samp_tmp, sdf_tmp, alpha_tmp[:,None], beta_tmp[:,None]).max(dim=-1).values
                             beta_right[bounds_tmp_max <= opt.VolSDF.eps] = beta_tmp[bounds_tmp_max <= opt.VolSDF.eps]
                             beta_left[bounds_tmp_max > opt.VolSDF.eps] = beta_tmp[bounds_tmp_max > opt.VolSDF.eps]
                         # updata beta++ and alpha++
@@ -453,7 +514,7 @@ class Graph(base.Graph):
                         # ----------------
                         # after upsample, the remained rays that not yet converged.
                         # ----------------
-                        bounds_masked = self.error_bound(d_samp_tmp, sdf_tmp, alpha[new_mask], beta[new_mask])
+                        bounds_masked = self.error_bound(d_samp_tmp, sdf_tmp, alpha[new_mask][:,None], beta[new_mask][:,None])
                         # bounds_masked = error_bound(d_vals_tmp, rays_d_tmp, sdf_tmp, alpha_net, beta[new_mask])
                         bounds_masked = torch.clamp(bounds_masked, 0, 1e5)  # NOTE: prevent INF caused NANs
 
@@ -470,10 +531,13 @@ class Graph(base.Graph):
                 print("existing rays which did not converge")
                 beta_plus = beta[~final_converge_flag]
                 alpha_plus = 1./beta_plus
-                final_fine_dvals[~final_converge_flag] = self.opacity_to_sample(opt, depth_samples[~final_converge_flag],sdf[~final_converge_flag], alpha_plus, beta_plus,*final_converge_flag.shape).squeeze(-1)
+                final_fine_dvals[~final_converge_flag] = self.opacity_to_sample(opt, depth_samples[~final_converge_flag],sdf[~final_converge_flag], alpha_plus[:,None], beta_plus[:,None],*final_converge_flag.shape).squeeze(-1)
                 final_iter_usage[~final_converge_flag] = -1
             beta[final_converge_flag] = beta_graph
-            return final_fine_dvals, beta, final_iter_usage
+            depth_coarse = self.sample_depth(opt, batch_size, num_rays=ray.shape[1]).squeeze(-1).repeat(*final_fine_dvals.shape[:2],1)
+            depth_sample_final=torch.cat([final_fine_dvals,depth_coarse],dim=-1)
+            depth_sample_final, _ = torch.sort(depth_sample_final, dim=-1)
+            return depth_sample_final, beta, final_iter_usage
 
     def sample_pdf(self,bins, weights, N_importance, det=False, eps=1e-5):
         # device = weights.get_device()
@@ -545,20 +609,34 @@ class Graph(base.Graph):
         depth_samples = depth_low + t * (depth_high - depth_low)  # [B,HW,Nf]
         return depth_samples[..., None]  # [B,HW,Nf,1]
     def render(self,opt,pose,intr=None,ray_idx=None,mode=None):
+        # ray_idx=torch.arange(0,100)
         batch_size = len(pose)
-        center, ray = camera.get_center_and_ray(opt, torch.inverse(pose)[:,:3,:4], intr=intr)  # [B,HW,3]
+        center, ray = camera.get_center_and_ray(opt, torch.inverse(pose)[:,:3,:4], intr=intr,mode=mode)  # [B,HW,3]
         while ray.isnan().any():  # TODO: weird bug, ray becomes NaN arbitrarily if batch_size>1, not deterministic reproducible
             center, ray = camera.get_center_and_ray(opt, pose, intr=intr)  # [B,HW,3]
         if ray_idx is not None:
             # consider only subset of rays
             center, ray = center[:, ray_idx], ray[:, ray_idx]
         # render with main MLP
-        depth_samples,beta, _ = self.volsdf_sampling(opt,center,ray)  # [B,HW,N,1]
+        if (opt.VolSDF.volsdf_sampling)&(mode=="train"):
+            depth_samples,beta, _ = self.volsdf_sampling(opt,center,ray)  # [B,HW,N,1]
+        else:
+            depth_samples=self.sample_depth(opt, batch_size, num_rays=ray.shape[1]).squeeze(-1).repeat(*center.shape[:2],1)
+        # else:
+        #     depth_samples=torch.linspace(opt.VolSDF.depth.min_d,opt.VolSDF.depth.max_d,opt.VolSDF.sample_intvs).to(opt.device)
+        #     depth_samples=depth_samples[None,None,:].repeat(*center.shape[:2],1)
+        #     pdb.set_trace()
+        #     beta=self.beta.expand(*depth_samples.shape)
+        alpha_render,beta_render=self.forward_ab()
         depth_samples=depth_samples[:,:,:,None]
         rgb_samples, sdf, normal = self.VolSDF.forward_samples(opt, center, ray, depth_samples, mode=mode)
-        density_samples=self.sdf_to_sigma(sdf,1./beta[:,:,None,None],beta[:,:,None,None])
-        rgb = self.VolSDF.composite(opt, ray, rgb_samples.squeeze(-1), density_samples.squeeze(-1), depth_samples)
-        ret = edict(rgb=rgb,normal=normal)  # [B,HW,K]
+        density_samples=self.sdf_to_sigma(sdf,alpha_render,beta_render)
+        rgb,prob = self.VolSDF.composite(opt, ray, rgb_samples.squeeze(-1), density_samples.squeeze(-1), depth_samples)
+        #_,ind=(prob[...,0]).max(dim=-1)
+        #normal = torch.gather(normal, dim=-2, index=ind[..., None].repeat([*(len(normal.shape) - 1) * [1], 3]))
+        #pts_3D_unif = torch.empty_like(normal).uniform_(-opt.VolSDF.obj_bounding_radius,opt.VolSDF.obj_bounding_radius).to(opt.device)
+        #normal_extra = self.VolSDF.gradient(pts_3D_unif)
+        ret = edict(rgb=rgb,normal=normal,beta=beta_render)  # [B,HW,K]
         return ret
 
 
