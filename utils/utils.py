@@ -137,6 +137,9 @@ def restore_checkpoint(opt,model,load_name=None,resume=False):
             getattr(model,key).load_state_dict(checkpoint[key])
     if resume:
         ep,it = checkpoint["epoch"],checkpoint["iter"]
+        if "beta" in checkpoint["graph"].keys():
+            print("reload_beta:{}".format(checkpoint["graph"]["beta"]))
+            model.graph.beta.data=checkpoint["graph"]["beta"]
         if resume is not True: assert(resume==(ep or it))
         print("resuming from epoch {0} (iteration {1})".format(ep,it))
     else: ep,it = None,None

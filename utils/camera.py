@@ -221,13 +221,18 @@ def angle_to_rotation_matrix(a,axis):
     M = M.roll((roll,roll),dims=(-2,-1))
     return M
 
-def get_center_and_ray(opt,pose,intr=None): # [HW,2]
+def get_center_and_ray(opt,pose,intr=None,mode="train"): # [HW,2]
     # given the intrinsic/extrinsic matrices, get the camera center and ray directions]
     assert(opt.camera.model=="perspective")
     with torch.no_grad():
         # compute image coordinate grid
-        y_range = torch.arange(opt.H,dtype=torch.float32,device=opt.device).add_(0.5)
-        x_range = torch.arange(opt.W,dtype=torch.float32,device=opt.device).add_(0.5)
+        if mode=="val":
+            H,W=opt.data.val_img_size
+            y_range = torch.arange(H, dtype=torch.float32, device=opt.device).add_(0.5)
+            x_range = torch.arange(W, dtype=torch.float32, device=opt.device).add_(0.5)
+        else:
+            y_range = torch.arange(opt.H,dtype=torch.float32,device=opt.device).add_(0.5)
+            x_range = torch.arange(opt.W,dtype=torch.float32,device=opt.device).add_(0.5)
         # pdb.set_trace()
         Y,X = torch.meshgrid(y_range,x_range) # [H,W]
         xy_grid = torch.stack([X,Y],dim=-1).view(-1,2) # [HW,2]
