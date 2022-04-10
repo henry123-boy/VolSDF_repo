@@ -16,3 +16,6 @@ With the structure for files organization below:
         |test.lst
         |train.lst
         |val.lst
+# Build up the Environment
+        
+        
