@@ -17,5 +17,9 @@ With the structure for files organization below:
         |train.lst
         |val.lst
 # Build up the Environment
+You can build up the required Environment by the command below:
+
+        conda env create -f VolSDF.yaml
+        conda activate VolSDF-env
         
         
