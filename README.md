@@ -2,6 +2,8 @@
 
 **This project is a Pytorch implementation of VolSDF**
 
+**Update** the extension of instant ngp was added 
+
 # Data preparation
 In this project, we reproduced the result of VolSDF in DTU. And the we got the processed data from https://s3.eu-central-1.amazonaws.com/avg-projects/unisurf/data/DTU.zip
 
