@@ -118,6 +118,7 @@ class Model():
         ret = self.graph.forward(opt,var,mode="train")
         loss = self.graph.compute_loss(opt,var,ret,mode="train")
         loss = self.summarize_loss(opt,var,loss)
+
         loss.all.backward()
         self.optim.step()
         # after train iteration
@@ -159,7 +160,7 @@ class Model():
             var = edict(batch)
             var = util.move_to_device(var,opt.device)
             var = self.graph.forward(opt,var,mode="val")
-            loss = self.graph.compute_loss(opt,var,mode="val")
+            loss = self.graph.compute_loss(opt,var,ret=None,mode="val")
             loss = self.summarize_loss(opt,var,loss)
             for key in loss:
                 loss_val.setdefault(key,0.)

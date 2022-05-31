@@ -19,14 +19,14 @@ class ConfigParser:
         if args.device:
             os.environ["CUDA_VISIBLE_DEVICES"] = args.device
         if args.resume is None:
-            msg_no_cfg = "Configuration file need to be specified. Add '-c config.json', for example."
+            msg_no_cfg = "Configuration file need to be specified. Add '-c config_hash_radiance.json', for example."
             assert args.config is not None, msg_no_cfg
             self.cfg_fname = Path(args.config)
             config = read_json(self.cfg_fname)
             self.resume = None
         else:        
             self.resume = Path(args.resume)
-            resume_cfg_fname = self.resume.parent / 'config.json'
+            resume_cfg_fname = self.resume.parent / 'config_hash_radiance.json'
             config = read_json(resume_cfg_fname)
             if args.config is not None:
                 config.update(read_json(Path(args.config)))
@@ -59,7 +59,7 @@ class ConfigParser:
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
         # save updated config file to the checkpoint dir
-        write_json(self.config, self.save_dir / 'config.json')
+        write_json(self.config, self.save_dir / 'config_hash_radiance.json')
 
         # configure logging module
         setup_logging(self.log_dir)

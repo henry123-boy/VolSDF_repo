@@ -1,14 +1,9 @@
 _parent_: config/base.yaml
 
 arch:                                                       # architectural optionss
-    layers_surface: [null,256,256,256,217,256,256,256,256,256] # hidden layers for occupancy filed with uncertainty MLP
-    layers_radiance: [null,256,256,256,256,3]                 # hidden layers for appearance MLP
-    skip: [4]                                               # skip connections
-    posenc:                                                 # positional encoding:
-        L_3D: 6                                            # number of bases (3D point)
-        L_view: 0                                           # number of bases (viewpoint)
-    density_activ: softplus                                 # activation function for output volume density
-    tf_init: true                                           # initialize network weights in TensorFlow style
+    mlp_surface_config: config/config_hash_density.json      # hidden layers for occupancy filed with uncertainty MLP
+    mlp_radiance_config: config/config_hash_radiance.json                 # hidden layers for appearance MLP
+
 
 VolSDF:                                                       # VolSDF options
     view_dep: true                                          # condition MLP on viewpoint
@@ -34,7 +29,7 @@ data:                                                       # data options
     scene:
     root: /remote-home/xyx/remote/NeRF2V_xyx/datasets/DTU
     train_img_size: [1200,1600]                                   # input image sizes [height,width]    the raw size [1200,1600] only support scale HW same time
-    val_img_size: [150,200]
+    val_img_size: [300,400]
     scale_radius: 3.0                                       # scale all the cameras to be within this radius
     num_workers: 4                                          # number of parallel workers for data loading
     preload: true                                           # preload the entire dataset into the memory
@@ -66,4 +61,4 @@ freq:                                                       # periodic actions d
     vis: 100                                               # visualize results (every N iterations)
     val: 5000                                               # validate on val set (every N iterations)
     ckpt: 5000                                             # save checkpoint (every N iterations)
-    vis_mesh: 10000                                            # the freq to visualize mesh
+    vis_mesh: 20000                                            # the freq to visualize mesh

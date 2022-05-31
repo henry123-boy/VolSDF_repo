@@ -14,6 +14,7 @@ import tqdm
 from easydict import EasyDict as edict
 sys.path.append(os.path.join(os.path.dirname(__file__),"../external"))
 import lpips
+import tinycudann as tcnn
 from utils.sfm_cal import SfMer
 from external.pohsun_ssim import pytorch_ssim
 from external.PointCould_vis.create_pointcloud import create_pointcloud as cret_ptc
@@ -23,6 +24,7 @@ from utils.utils import log,debug
 from . import base
 import utils.camera as camera
 from utils.utils_vis import extract_mesh
+import json
 epsilon = 1e-6
 
 class Model(base.Model):
@@ -73,7 +75,7 @@ class Model(base.Model):
         loader = tqdm.trange(opt.max_iter, desc="training", leave=False)
         num_scenes=len(self.train_data.all.idx)
         var = edict()
-        if self.iter_start== 0: self.validate(opt, 0)
+        #if self.iter_start== 0: self.validate(opt, 0)
         for self.it in loader:
             if self.it < self.iter_start: continue
             # set var to all available images
@@ -125,8 +127,8 @@ class Model(base.Model):
     def visualize(self, opt, var, step=0, split="train", eps=1e-10):
         if split=="val":
             H,W=opt.data.val_img_size
-            self.tb.add_image("{0}/{1}".format(split, "ground_truth_rgb"), var.image.permute(0,2,1).view(3,H,W))
-            self.tb.add_image("{0}/{1}".format(split, "predicted_rgb"), var.rgb.permute(0, 2, 1).view(3, H, W))
+            self.tb.add_image("{0}/{1}".format(split, "ground_truth_rgb"), var.image.permute(0,2,1).view(3,H,W),step)
+            self.tb.add_image("{0}/{1}".format(split, "predicted_rgb"), var.rgb.permute(0, 2, 1).view(3, H, W),step)
             if (step%opt.freq.vis_mesh==0)&(step>0):
                 os.makedirs("{0}/mesh".format(opt.output_path),exist_ok=True)
                 opt.mesh_dir="{0}/mesh".format(opt.output_path)
@@ -143,85 +145,63 @@ class VolSDF(nn.Module):
         super().__init__()
         self.define_network(opt)
         self.opt = opt
-        self.rescale=1.0
+        self.rescale=4.0
 
     def define_network(self, opt):
-        input_3D_dim = 3 + 6 * opt.arch.posenc.L_3D if opt.arch.posenc else 3
-        input_view_dim = 3 + 6 * opt.arch.posenc.L_view if opt.arch.posenc else 3
-        print("building the mlp for surface......")
-        self.mlp_surface = torch.nn.ModuleList()
-        L_surface = util.get_layer_dims(opt.arch.layers_surface)
-        bias = 1
-        for li, (k_in, k_out) in enumerate(L_surface):
-            if li == 0: k_in = input_3D_dim
-            if li in opt.arch.skip: k_in += input_3D_dim
-            if li == len(L_surface) - 1: k_out += 1  # 256+1   1 is for SDF, and 256 is the dim of position feature
-            linear = torch.nn.Linear(k_in, k_out)
-            if opt.arch.tf_init:
-                if li == len(L_surface) - 1:
-                    torch.nn.init.normal_(linear.weight, mean=np.sqrt(np.pi) / np.sqrt(L_surface[li][0]), std=0.0001)
-                    torch.nn.init.constant_(linear.bias, -bias)
-                elif li == 0:
-                    torch.nn.init.constant_(linear.bias, 0.0)
-                    torch.nn.init.constant_(linear.weight[:, 3:], 0.0)
-                    torch.nn.init.normal_(linear.weight[:, :3], 0.0, np.sqrt(2) / np.sqrt(k_out))
-                elif li in opt.arch.skip:
-                    torch.nn.init.constant_(linear.bias, 0.0)
-                    torch.nn.init.normal_(linear.weight, 0.0, np.sqrt(2) / np.sqrt(k_out))
-                    torch.nn.init.constant_(linear.weight[:, -(input_3D_dim - 3):], 0.0)   # NOTE: this contrains the concat order to be  [h, x_embed]
-                else:
-                    torch.nn.init.constant_(linear.bias, 0.0)
-                    torch.nn.init.normal_(linear.weight, 0.0, np.sqrt(2) / np.sqrt(k_out))
-            linear = nn.utils.weight_norm(linear)
-            self.mlp_surface.append(linear)
+        with open(opt.arch.mlp_surface_config) as config_file:
+            self.config_surface = json.load(config_file)
+        with open(opt.arch.mlp_radiance_config) as config_file:
+            self.config_radiance = json.load(config_file)
+        print("building the mlp for surface with hash encoding......")
+        self.hash_ec=tcnn.Encoding(3,encoding_config=self.config_surface["encoding"])
+        # self.mlp_surface = tcnn.NetworkWithInputEncoding(n_input_dims=3, n_output_dims=16,
+        #                                       encoding_config=self.config_surface["encoding"], network_config=self.config_surface["network"])
+        self.mlp_surface=nn.Sequential(
+            nn.Linear(32,64),
+            nn.ReLU(),
+            nn.Linear(64,65),
+        )
+
         print("building the mlp for radiance......")
-        self.mlp_radiance = torch.nn.ModuleList()
-        spatial_dim = opt.arch.layers_surface[-1]
-        L_radiance = util.get_layer_dims(opt.arch.layers_radiance)
-        for li, (k_in, k_out) in enumerate(L_radiance):
-            if li == 0: k_in = spatial_dim + (input_view_dim if opt.VolSDF.view_dep else 0) + 6            # the 6 represents 3+3, one of those is the dim of gradient, and another for position
-            linear = torch.nn.Linear(k_in, k_out)
-            if opt.arch.tf_init:
-                linear = nn.utils.weight_norm(linear)
-            self.mlp_radiance.append(linear)
-        print("defining the activation fuction......")
-        # beta=100 is very important, but i am not sure why is that
-        self.softplus = nn.Softplus(beta=100,threshold=20)
-        self.relu = nn.ReLU()
-        self.tanh = nn.Tanh()
-        self.sigmoid = nn.Sigmoid()
+        # sphere harmonics embedding
+        self.sh_ec=tcnn.Encoding(3,encoding_config=self.config_radiance["encoding"])
+        self.mlp_radiance = tcnn.Network(n_input_dims=87,n_output_dims=3,network_config=self.config_radiance["network"])
+
 
     def infer_sdf(self, p,mode="only_sdf"):
-        p_rescale=p / self.rescale
-        if self.opt.arch.posenc:
-            points_enc = self.positional_encoding(self.opt, p_rescale, L=self.opt.arch.posenc.L_3D)
-            points_enc = torch.cat([p_rescale, points_enc], dim=-1)  # [B,...,6L+3]
-        else: points_enc = p_rescale
-        feat=points_enc
-        for li,layer in enumerate(self.mlp_surface):
-            if li in self.opt.arch.skip: feat = torch.cat([feat,points_enc],dim=-1)/ np.sqrt(2)
-            feat = layer(feat)
-            if li <= len(self.mlp_surface) - 2:
-                feat = self.softplus(feat)
+        # p_rescale=(p+self.rescale) / (2*self.rescale)
+        p_rescale = p/self.rescale
+        # print(p_rescale.max())
+        # print(p_rescale.min())
+        # if p_rescale.requires_grad==True:
+        #     pdb.set_trace()
+        #     x=self.hash_ec(p_rescale.view(-1,3))
+        #     pdb.set_trace()
+        feat=self.hash_ec(p_rescale.view(-1,3)).float()
+        feat=self.mlp_surface(feat)
+        if len(p_rescale.shape)==3:
+            p_rescale=p_rescale.unsqueeze(0)
+        # elif len(p_rescale.shape)==2:
+        #     pdb.set_trace()
+        if len(p_rescale.shape) != 2:
+            batch,n_rays,n_pts,_=p_rescale.shape
+            feat=feat.view(batch,n_rays,n_pts,65)
         if mode=="only_sdf":
             return feat[...,:1]
         else:
             return feat
     def infer_rad(self,points_3D, normals, ray_enc, feat):
-        rendering_input = torch.cat([points_3D, ray_enc, normals, feat], dim=-1)
-        x = rendering_input
-        num_layers_app = len(util.get_layer_dims(self.opt.arch.layers_radiance))
-        for li, layer in enumerate(self.mlp_radiance):
-            x = layer(x)
-            if li <= num_layers_app - 2:
-                x = self.relu(x)
-        x = self.sigmoid(x)
+        # p_rescale = (points_3D + self.rescale) / (2 * self.rescale)
+        p_rescale = points_3D / self.rescale
+        rendering_input = torch.cat([p_rescale.view(-1,3), ray_enc, normals.view(-1,3), feat.view(-1,65)], dim=-1)
+        x=self.mlp_radiance(rendering_input)
         return x
 
     def gradient(self, p):
         with torch.enable_grad():
             p.requires_grad_(True)
             y = self.infer_sdf(p,mode="only_sdf")
+            #y=self.hash_ec(p.view(-1,3))
             d_output = torch.ones_like(y, requires_grad=False, device=y.device)
             gradients = torch.autograd.grad(
                 outputs=y,
@@ -237,27 +217,18 @@ class VolSDF(nn.Module):
             sdf=x[..., :1]
             return torch.min(sdf, opt.VolSDF.obj_bounding_radius - points_3D.norm(dim=-1, keepdim=True))
         elif ray_unit is not None:
-            if self.opt.arch.posenc:
-                ray_enc = self.positional_encoding(self.opt, ray_unit, L=self.opt.arch.posenc.L_view)
-                ray_enc = torch.cat([ray_unit, ray_enc], dim=-1)  # [B,...,6L+3]
-            else:
-                ray_enc = ray_unit
+            batch, n_rays, n_pts, _ = ray_unit.shape
+            ray_enc=self.sh_ec(ray_unit.reshape(-1,3))
             normals = self.gradient(points_3D)
             # normals = n / (torch.norm(n, dim=-1, keepdim=True)+1e-6)
-            rgb = self.infer_rad(points_3D, normals, ray_enc, x[..., 1:])
+            # the normals have to be the tensor without grad
+            rgb = self.infer_rad(points_3D, normals, ray_enc, x)
+            rgb=rgb.view(batch,n_rays,n_pts,3)
             if return_addocc:
                 sdf = x[..., :1]
                 return rgb, torch.min(sdf, opt.VolSDF.obj_bounding_radius - points_3D.norm(dim=-1, keepdim=True)),normals
             else:
                 return rgb
-    def positional_encoding(self, opt, input, L):  # [B,...,N]
-        shape = input.shape
-        freq = 2 ** torch.arange(L, dtype=torch.float32, device=opt.device) * np.pi  # [L]
-        spectrum = input[..., None] * freq  # [B,...,N,L]
-        sin, cos = spectrum.sin(), spectrum.cos()  # [B,...,N,L]
-        input_enc = torch.stack([sin, cos], dim=-2)  # [B,...,N,2,L]
-        input_enc = input_enc.view(*shape[:-1], -1)  # [B,...,2NL]
-        return input_enc
     def forward_samples(self,opt,center,ray,depth_samples,mode=None):
         points_3D_samples = camera.get_3D_points_from_depth(opt,center,ray,depth_samples,multi_samples=True) # [B,HW,N,3]
         if opt.VolSDF.view_dep:
@@ -382,7 +353,7 @@ class Graph(base.Graph):
 
     def get_pose(self,opt,var,mode=None):
         return var.pose
-    def compute_loss(self,opt,var,ret=None,mode=None):
+    def compute_loss(self,opt,var,ret,mode=None):
         loss = edict()
         batch_size = len(var.idx)
         image = var.image
@@ -638,5 +609,3 @@ class Graph(base.Graph):
         #normal_extra = self.VolSDF.gradient(pts_3D_unif)
         ret = edict(rgb=rgb,normal=normal,beta=beta_render)  # [B,HW,K]
         return ret
-
-

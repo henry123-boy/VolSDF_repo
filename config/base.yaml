@@ -8,7 +8,7 @@ seed: 0                                                     # seed number (for b
 gpu: 0                                                      # GPU index number
 cpu: false                                                  # run only on CPU (not supported now)
 load:                                                       # load checkpoint from filename
-
+debug: false
 arch: {}                                                    # architectural options
 
 data:                                                       # data options

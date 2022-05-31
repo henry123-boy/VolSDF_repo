@@ -1,3 +1,4 @@
+import copy
 import pdb
 
 import numpy as np
@@ -16,8 +17,8 @@ from skimage.transform import rescale
 from . import base
 from utils import camera
 from utils.utils import log,debug
-
-
+import open3d as o3d
+from colmap_utils.database import COLMAPDatabase
 class Dataset(base.Dataset):
     def __init__(self,opt,split="train",subset=None):
         if split=="train":
@@ -33,6 +34,7 @@ class Dataset(base.Dataset):
         self.path_image = "{0}/{1}/image".format(self.path,opt.data.scene)
         self.path_mask  = "{0}/{1}/mask".format(self.path,opt.data.scene)
         self.path_cam = '{0}/{1}/cameras.npz'.format(self.path,opt.data.scene)
+        self.obj_pcl='{0}/{1}/pcl.npz'.format(self.path,opt.data.scene)
         image_fnames = sorted(os.listdir(self.path_image))
         image_fnames=[os.path.join(self.path_image,img_f_i) for img_f_i in  image_fnames]
         mask_fnames = sorted(os.listdir(self.path_mask))
@@ -40,14 +42,20 @@ class Dataset(base.Dataset):
         self.n_images = len(image_fnames)
         # loading the pose
         camera_dict = np.load(self.path_cam)
+        obj_pcl=np.load(self.obj_pcl)      # npz结尾一般为压缩文件，可以用obj_pcl.files查看其内容
+        obj_color = obj_pcl["colors"] / 255.0
+        obj_pcl=obj_pcl["points"]
+
+
         scale_mats = [camera_dict['scale_mat_%d' % idx].astype(np.float32) for idx in range(self.n_images)]
         world_mats = [camera_dict['world_mat_%d' % idx].astype(np.float32) for idx in range(self.n_images)]
+
 
         self.intrinsics_all = []
         self.c2w_all = []
         cam_center_norms = []
         for scale_mat, world_mat in zip(scale_mats, world_mats):
-            P = world_mat @ scale_mat
+            P = world_mat @ scale_mat                      # c2w
             P = P[:3, :4]
             intrinsics, pose = self.load_K_Rt_from_P(P)
             cam_center_norms.append(np.linalg.norm(pose[:3, 3]))
@@ -65,14 +73,87 @@ class Dataset(base.Dataset):
             for i in range(len(self.c2w_all)):
                 self.c2w_all[i][:3, 3] *= (opt.VolSDF.obj_bounding_radius / max_cam_norm / 1.1)
 
+        # ------------------------------------------------------------
+        id_list = os.listdir(self.path_image)
+
+        id_list = [id[:-4] for id in id_list if id.endswith('.png')]
+        id_list.sort(key=lambda _: int(_))
+        data_list = []
+        for i, id in enumerate(id_list):
+            rt = self.c2w_all[i]
+            rt = np.linalg.inv(rt)
+            r = rt[:3, :3]
+            t = rt[:3, 3]
+            q = self.rotmat2qvec(r)
+            data = [i + 1, *q, *t, 1, f'{id}.png']
+            data = [str(_) for _ in data]
+            data = ' '.join(data)
+            data_list.append(data)
+
+        os.makedirs(f'./colmap/model/', exist_ok=True)
+        os.system(f'touch ./colmap/model/points3D.txt')
+
+        # intrinsic = np.loadtxt(f'colmap/intrinsic_depth.txt')
+
+        with open(f'./colmap/model/cameras.txt', 'w') as f:
+            f.write(
+                f'1 PINHOLE {self.dsam_W} {self.dsam_H} {intrinsics[0][0]} {intrinsics[1][1]} {intrinsics[0][2]} {intrinsics[1][2]}')
+
+        with open(f'./colmap/model/images.txt', 'w') as f:
+            for data in data_list:
+                f.write(data)
+                f.write('\n\n')
+
+        db = COLMAPDatabase.connect(f'/remote-home/xyx/remote/VolSDF_repo-main/colmap/database.db')
+
+        images = list(db.execute('select * from images'))
+
+        data_list = []
+        for image in images:
+            id = image[1][:-4]
+            # if id=='1':
+            #     pdb.set_trace()
+            rt = self.c2w_all[int(id)]
+            rt = np.linalg.inv(rt)
+            r = rt[:3, :3]
+            t = rt[:3, 3]
+            q = self.rotmat2qvec(r)
+            data = [image[0], *q, *t, 1, f'{id}.png']
+            data = [str(_) for _ in data]
+            data = ' '.join(data)
+            data_list.append(data)
+
+        with open(f'colmap/model/images.txt', 'w') as f:
+            for data in data_list:
+                f.write(data)
+                f.write('\n\n')
+
+        # ------------------------------------------------------------
+
+
+        obj_pcl*=(opt.VolSDF.obj_bounding_radius / max_cam_norm / 1.1)
+        self.obj_pcl=obj_pcl
+        # pdb.set_trace()
+
+        self.obj_color=obj_color
+        pcl_vis = o3d.geometry.PointCloud()
+        pcl_vis.points = o3d.utility.Vector3dVector(obj_pcl)
+        pcl_vis.colors = o3d.utility.Vector3dVector(obj_color)
+        o3d.io.write_point_cloud("./test.ply", pcl_vis, write_ascii=False, compressed=False)
+
+
         self.rgb_images = []
         self.list = image_fnames
         num_val_split = int(len(self) * opt.data.val_ratio)
+
         image_fnames = image_fnames[:-num_val_split] if split == "train" else image_fnames[-num_val_split:]
         mask_fnames = mask_fnames[:-num_val_split] if split == "train" else mask_fnames[-num_val_split:]
+
         self.n_images =len(image_fnames)
         self.c2w_all=self.c2w_all[:-num_val_split] if split == "train" else self.c2w_all[-num_val_split:]
         self.intrinsics_all =self.intrinsics_all[:-num_val_split] if split == "train" else self.intrinsics_all[-num_val_split:]
+
+
         self.list = image_fnames
         for path in tqdm(image_fnames, desc='loading images...'):
             rgb = self.load_rgb(path, downscale)
@@ -100,6 +181,18 @@ class Dataset(base.Dataset):
         img = img.transpose(2, 0, 1)
         return img
 
+    def rotmat2qvec(self,R):
+        Rxx, Ryx, Rzx, Rxy, Ryy, Rzy, Rxz, Ryz, Rzz = R.flat
+        K = np.array([
+            [Rxx - Ryy - Rzz, 0, 0, 0],
+            [Ryx + Rxy, Ryy - Rxx - Rzz, 0, 0],
+            [Rzx + Rxz, Rzy + Ryz, Rzz - Rxx - Ryy, 0],
+            [Ryz - Rzy, Rzx - Rxz, Rxy - Ryx, Rxx + Ryy + Rzz]]) / 3.0
+        eigvals, eigvecs = np.linalg.eigh(K)
+        qvec = eigvecs[[3, 0, 1, 2], np.argmax(eigvals)]
+        if qvec[0] < 0:
+            qvec *= -1
+        return qvec
     def load_mask(self,path, downscale=1):
         alpha = imageio.imread(path, as_gray=True)
         alpha = skimage.img_as_float32(alpha)
@@ -114,6 +207,7 @@ class Dataset(base.Dataset):
         modified from IDR https://github.com/lioryariv/idr
         """
         out = cv2.decomposeProjectionMatrix(P)
+
         K = out[0]
         R = out[1]
         t = out[2]
@@ -135,7 +229,9 @@ class Dataset(base.Dataset):
             image=self.rgb_images[idx],
             intr=self.intrinsics_all[idx][:3,:3],
             pose=self.c2w_all[idx],
-            mask=self.object_masks[idx]
+            mask=self.object_masks[idx],
+            obj_pcl=self.obj_pcl,
+            obj_color=self.obj_color,
         )
         return sample
 

@@ -1,3 +1,5 @@
+import pdb
+
 import numpy as np
 import os,sys,time
 import torch
@@ -9,6 +11,7 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import PIL
 import imageio
 from easydict import EasyDict as edict
+import open3d as o3d
 
 from . import camera          # 需要相对路径来import，同时不能from .. import 因为相对路径极限就是当前的路径
 
@@ -137,6 +140,139 @@ def vis_cameras(opt,vis,step,poses=[],colors=["blue","magenta"],plot_dist=True):
         ),
         opts=dict(title="{} poses ({})".format(win_name,step),),
     ))
+@torch.no_grad()
+def vis_cameras_pts(opt,vis,step,poses=[],pts=[],pts_colors=[],colors=["blue","magenta"],plot_dist=True):
+    win_name = "{}/{}".format(opt.group,opt.name)
+    data = []
+    # set up plots
+    centers = []
+    mesh_tem = o3d.geometry.TriangleMesh()
+    vts=[]
+    trangles=[]
+    clrs=[]
+    len_total=0
+    for pose,color in zip(poses,colors):
+        pose = pose.detach().cpu()[:3,:4]
+        vertices,faces,wireframe = get_camera_mesh(pose,depth=opt.visdom.cam_depth)
+        vts.append(vertices.squeeze().numpy())
+        trangles.append(faces.squeeze().numpy()+len_total)
+        len_total+=vertices.squeeze().numpy().shape[0]
+        clrs.append(np.array([0,1,0]).reshape(1,-1).repeat(faces.squeeze().numpy().shape[0],axis=0))
+        # lines_set=o3d.geometry.LineSet()
+        # lines_set.points=o3d.utility.Vector3dVector(vertices)
+        # lines_set.lines = o3d.utility.Vector2iVector(faces)
+        center = vertices[:,-1]
+        centers.append(center)
+        # camera centers
+        data.append(dict(
+            type="scatter3d",
+            x=[float(n) for n in center[:,0]],
+            y=[float(n) for n in center[:,1]],
+            z=[float(n) for n in center[:,2]],
+            mode="markers",
+            marker=dict(color=color,size=3),
+        ))
+        # colored camera mesh
+        vertices_merged,faces_merged = merge_meshes(vertices,faces)
+        data.append(dict(
+            type="mesh3d",
+            x=[float(n) for n in vertices_merged[:,0]],
+            y=[float(n) for n in vertices_merged[:,1]],
+            z=[float(n) for n in vertices_merged[:,2]],
+            i=[int(n) for n in faces_merged[:,0]],
+            j=[int(n) for n in faces_merged[:,1]],
+            k=[int(n) for n in faces_merged[:,2]],
+            flatshading=True,
+            color=color,
+            opacity=0.05,
+        ))
+        # camera wireframe
+        wireframe_merged = merge_wireframes(wireframe)
+        data.append(dict(
+            type="scatter3d",
+            x=wireframe_merged[0],
+            y=wireframe_merged[1],
+            z=wireframe_merged[2],
+            mode="lines",
+            line=dict(color=color,),
+            opacity=0.3,
+        ))
+    for pts,pts_color in zip(pts,pts_colors):
+        data.append(dict(
+            type="scatter3d",
+            x=[float(pts[0])],
+            y=[float(pts[1])],
+            z=[float(pts[2])],
+            mode="markers",
+            marker=dict(color=[float(c) for c in pts_color], size=3),
+        ))
+    if plot_dist:
+        # distance between two poses (camera centers)
+        center_merged = merge_centers(centers[:2])
+        data.append(dict(
+            type="scatter3d",
+            x=center_merged[0],
+            y=center_merged[1],
+            z=center_merged[2],
+            mode="lines",
+            line=dict(color="red",width=4,),
+        ))
+        if len(centers)==4:
+            center_merged = merge_centers(centers[2:4])
+            data.append(dict(
+                type="scatter3d",
+                x=center_merged[0],
+                y=center_merged[1],
+                z=center_merged[2],
+                mode="lines",
+                line=dict(color="red",width=4,),
+            ))
+    vts=np.concatenate(vts,axis=0)
+    clrs=np.concatenate(clrs,axis=0)
+    trangles=np.concatenate(trangles,axis=0)
+    mesh_tem.vertices=o3d.utility.Vector3dVector(vts)
+    mesh_tem.triangles = o3d.utility.Vector3iVector(trangles)
+    mesh_tem.vertex_colors=o3d.utility.Vector3dVector(clrs)
+    o3d.io.write_triangle_mesh("./test_camera.ply", mesh_tem, write_ascii=False, compressed=False)
+    # send data to visdom
+    vis._send(dict(
+        data=data,
+        win="poses and points",
+        eid=win_name,
+        layout=dict(
+            title="({})".format(step),
+            autosize=True,
+            margin=dict(l=30,r=30,b=30,t=30,),
+            showlegend=False,
+            yaxis=dict(
+                scaleanchor="x",
+                scaleratio=1,
+            )
+        ),
+        opts=dict(title="{} poses ({})".format(win_name,step),),
+    ))
+
+@torch.no_grad()
+def vis_cameras_o3d(opt,poses=[],pts=[],pts_colors=[],plot_dist=True):
+    mesh_tem = o3d.geometry.TriangleMesh()
+    vts=[]
+    trangles=[]
+    clrs=[]
+    len_total=0
+    for pose in poses:
+        pose = pose.detach().cpu()[:3,:4]
+        vertices,faces,wireframe = get_camera_mesh(pose,depth=opt.visdom.cam_depth)
+        vts.append(vertices.squeeze().numpy())
+        trangles.append(faces.squeeze().numpy()+len_total)
+        len_total+=vertices.squeeze().numpy().shape[0]
+        clrs.append(np.array([0,1,0]).reshape(1,-1).repeat(faces.squeeze().numpy().shape[0],axis=0))
+    vts=np.concatenate(vts,axis=0)
+    clrs=np.concatenate(clrs,axis=0)
+    trangles=np.concatenate(trangles,axis=0)
+    mesh_tem.vertices=o3d.utility.Vector3dVector(vts)
+    mesh_tem.triangles = o3d.utility.Vector3iVector(trangles)
+    mesh_tem.vertex_colors=o3d.utility.Vector3dVector(clrs)
+    o3d.io.write_triangle_mesh("./test_camera.ply", mesh_tem, write_ascii=False, compressed=False)
 
 def get_camera_mesh(pose,depth=1):
     vertices = torch.tensor([[-0.5,-0.5,1],

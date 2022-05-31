@@ -1,0 +1,109 @@
+H: null
+VolSDF:
+    beta_init: 0.1
+    depth:
+        max_d: 6
+        min_d: 0.0
+        param: metric
+    eps: 0.1
+    final_sample_intvs: 64
+    max_bisection_itr: 10
+    max_upsample_iter: 6
+    obj_bounding_radius: 3.0
+    outside_scene: builtin
+    rand_rays: 1024
+    sample_intvs: 128
+    speed_factor: 10.0
+    view_dep: true
+    volsdf_sampling: true
+W: null
+arch:
+    density_activ: softplus
+    layers_radiance:
+    - null
+    - 256
+    - 256
+    - 256
+    - 256
+    - 3
+    layers_surface:
+    - null
+    - 256
+    - 256
+    - 256
+    - 217
+    - 256
+    - 256
+    - 256
+    - 256
+    - 256
+    posenc:
+        L_3D: 6
+        L_view: 0
+    skip:
+    - 4
+    tf_init: true
+batch_size: 1
+camera:
+    model: perspective
+    ndc: false
+    noise: false
+cpu: false
+data:
+    augment: {}
+    center_crop: null
+    dataset: DTU
+    image_size:
+    - null
+    - null
+    num_workers: 4
+    preload: true
+    root: /remote-home/xyx/remote/NeRF2V_xyx/datasets/DTU
+    scale_radius: 3.0
+    scene: scan_65
+    train_img_size:
+    - 1200
+    - 1600
+    train_sub: null
+    val_img_size:
+    - 150
+    - 200
+    val_on_test: true
+    val_ratio: 0.1
+    val_sub: null
+device: cuda:0
+freq:
+    ckpt: 5000
+    scalar: 100
+    val: 5000
+    vis: 100
+    vis_mesh: 10000
+gpu: 0
+group: Vol
+load: null
+loss_weight:
+    render: 0
+    w_eikonal: -1
+max_epoch: null
+max_iter: 100000
+model: VolSDF
+name: exp_1
+optim:
+    algo: Adam
+    lr: 0.0005
+    lr_end: 5.0e-05
+    sched:
+        gamma: null
+        type: ExponentialLR
+output_path: output/Vol/exp_1
+output_root: output
+resume: false
+seed: 0
+tb:
+    num_images:
+    - 4
+    - 8
+visdom:
+    port: 9000
+    server: localhost
+yaml: VolSDF_DTU
